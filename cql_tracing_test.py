@@ -1,5 +1,6 @@
 import pytest
 import logging
+import re
 
 from distutils.version import LooseVersion
 
@@ -19,15 +20,22 @@ class TestCqlTracing(Tester):
     #      instantiated when specified as a custom tracing implementation.
     """
 
-    def prepare(self, create_keyspace=True, nodes=3, rf=3, protocol_version=3, jvm_args=None, random_partitioner=False, **kwargs):
+    def prepare(self, create_keyspace=True, nodes=3, rf=3, protocol_version=3, jvm_args=None, random_partitioner=False, auth=False, **kwargs):
         if jvm_args is None:
             jvm_args = []
 
         jvm_args.append('-Dcassandra.wait_for_tracing_events_timeout_secs=15')
-
         cluster = self.cluster
-        cluster.set_configuration_options(values={'write_request_timeout_in_ms': 30000,
-                                          'read_request_timeout_in_ms': 30000})
+        if auth:
+            config = {'authenticator': 'org.apache.cassandra.auth.PasswordAuthenticator',
+                  'authorizer': 'org.apache.cassandra.auth.CassandraAuthorizer',
+                  'role_manager': 'org.apache.cassandra.auth.CassandraRoleManager',
+                  'permissions_update_interval_in_ms': 1000}
+        else:
+            config = {'write_request_timeout_in_ms': 30000,
+                    'read_request_timeout_in_ms': 30000}
+        self.cluster.set_configuration_options(values=config)
+
 
         if random_partitioner:
             cluster.set_partitioner("org.apache.cassandra.dht.RandomPartitioner")
@@ -35,10 +43,11 @@ class TestCqlTracing(Tester):
             cluster.set_partitioner("org.apache.cassandra.dht.Murmur3Partitioner")
 
         cluster.populate(nodes)
-        node1 = cluster.nodelist()[0]
-        cluster.start(jvm_args=jvm_args)
+        cluster.start(wait_for_binary_proto=True, jvm_args=jvm_args)
 
-        session = self.patient_cql_connection(node1, protocol_version=protocol_version)
+        node1 = cluster.nodelist()[0]
+
+        session = self.patient_cql_connection(node1, protocol_version=protocol_version, user='cassandra', password='cassandra')
         if create_keyspace:
             create_ks(session, 'ks', rf)
         return session
@@ -189,3 +198,34 @@ class TestCqlTracing(Tester):
             check_for_errs_in = err
         assert "Default constructor for Tracing class 'org.apache.cassandra.tracing.TracingImpl' is inaccessible." \
                in check_for_errs_in
+
+    @since('2.2')
+    def test_tracing_session_ends(self):
+        """
+        Test that trace session ends properly
+
+        @jira_ticket CASSANDRA-16316
+        """
+        session = self.prepare(auth=True)
+        node1 = self.cluster.nodelist()[0]
+        cqlsh_options=['-u', 'cassandra', '-p', 'cassandra']
+        
+        # create a bunch of trace events
+        for _ in range(10):
+            out, err, _ = node1.run_cqlsh('TRACING ON; SELECT * from system_auth.roles', cqlsh_options=cqlsh_options)
+            assert 'Tracing session: ' in out
+            assert 'Request complete ' in out
+
+        out, err, _ = node1.run_cqlsh('SELECT * from system_traces.events', cqlsh_options=cqlsh_options)
+        pattern = re.compile('(\(\d+ rows\))')
+        
+        match = pattern.search(out)
+        if match:
+            rows = match.group(1)
+            for _ in range(20):
+                out, err, _ = node1.run_cqlsh('SELECT * from system_traces.events', cqlsh_options=cqlsh_options)
+                # make sure that number of rows do not change after tracing is complete
+                assert rows in out
+        else:
+            # no match, test case fails
+            assert False
