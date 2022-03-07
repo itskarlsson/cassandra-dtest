@@ -722,16 +722,21 @@ class TestRepair(BaseRepairTest):
 
         opts = ["-dc", "dc1", "-dc", "dc13"]
         opts += _repair_options(self.cluster.version(), ks="ks", sequential=False)
-        
         # repair should fail because dc13 does not exist
-        with pytest.raises(ToolError):
+        try:
             node1.repair(opts)
+        except Exception as e:
+            nodetool_error = e
+        assert 'data center(s) [dc13] not found' in repr(nodetool_error)
 
         opts = ["-dc", "dc2", "-dc", "dc3"]
         opts += _repair_options(self.cluster.version(), ks="ks", sequential=False)
         # repair should fail because local dc not included in repair
-        with pytest.raises(ToolError):
+        try:
             node1.repair(opts)
+        except Exception as e:
+            nodetool_error = e
+        assert 'the local data center must be part of the repair' in repr(nodetool_error)
 
     def _setup_multi_dc(self):
         """
